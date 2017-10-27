@@ -14,6 +14,7 @@
 /****************************************************************************/
 #include <dia2.h>
 #include <cvconst.h>
+#include <algorithm>
 
 class DECLSPEC_UUID("e60afbee-502d-46ae-858f-8272a09bd707") DiaSource71;
 class DECLSPEC_UUID("bce36434-2c24-499e-bf49-8bd99b0eeb68") DiaSource80;
@@ -24,7 +25,13 @@ class DECLSPEC_UUID("3bfcea48-620f-4b6b-81f7-b9af75454c7d") DiaSource120;
 class DECLSPEC_UUID("e6756135-1e65-4d17-8576-610761398c3c") DiaSource140;
 //class DECLSPEC_UUID("79f1bb5f-b66e-48e5-b6a9-1545c323ca3d") IDiaDataSource;
 
+
 /****************************************************************************/
+IDiaSession* PDBFileReader::Session;
+std::vector<std::wstring> PDBFileReader::fileNames;
+std::unordered_map<std::wstring, DWORD> PDBFileReader::files;
+std::unordered_map<DWORD, DWORD> PDBFileReader::fileMap;
+
 
 struct PDBFileReader::SectionContrib
 {
@@ -204,6 +211,84 @@ struct DumpedSymbol
     //std::vector<DumpedSymbol> inlineFrames;
 };
 
+
+struct FunctionLineInfo
+{
+	void HandleChildren(IDiaSymbol* pSymbol)
+	{
+		{
+			IDiaEnumSymbols *enumChildren;
+			if (SUCCEEDED(pSymbol->findChildren(SymTagInlineSite, NULL, 0, &enumChildren)))
+			{
+				IDiaSymbol *pChild;
+				ULONG celtChildren = 0;
+				while (SUCCEEDED(enumChildren->Next(1, &pChild, &celtChildren)) && (celtChildren == 1))
+				{
+					HandleChild(pChild);
+					pChild->Release();
+				}
+			}
+		}
+	}
+
+	void HandleChild(IDiaSymbol* pSymbol)
+	{
+		BSTR pFuncName;
+		pSymbol->get_name(&pFuncName);
+		int funcNameId = PDBFileReader::getFunctionNameId(pFuncName);
+
+		IDiaEnumLineNumbers* pLines = NULL;
+		if (SUCCEEDED(pSymbol->findInlineeLines(&pLines)))
+		{
+			if (bytes.empty())
+			{
+				ByteInfo no = { -1, 0, -1 };
+				bytes.resize(function_length, no);
+			}
+			IDiaLineNumber *pLine;
+			ULONG celtLines = 0;
+			while (SUCCEEDED(pLines->Next(1, &pLine, &celtLines)) && (celtLines == 1))
+			{
+				DWORD length = -1;  pLine->get_length(&length);
+				DWORD rva = -1; pLine->get_relativeVirtualAddress(&rva);
+				rva -= function_rva;
+				DWORD end_rva = rva + length;
+
+				DWORD lineStart = -1; pLine->get_lineNumber(&lineStart);
+				DWORD fileId = -1;  pLine->get_sourceFileId(&fileId);
+				fileId = PDBFileReader::getFileNameId(fileId);
+
+				for (int a = rva; a < end_rva; ++a)
+				{
+					bytes[a].fileId = fileId;
+					bytes[a].line = lineStart;
+					bytes[a].funcNameId = funcNameId;
+				}
+				pLine->Release();
+			}
+			HandleChildren(pSymbol);
+		}
+	}
+
+	FunctionLineInfo(IDiaSymbol* pSymbol)
+	{
+		function_length = -1;  pSymbol->get_length(&function_length);
+		pSymbol->get_relativeVirtualAddress(&function_rva);
+		HandleChildren(pSymbol);
+	}
+
+
+	struct ByteInfo
+	{
+		int line;
+		DWORD fileId;
+		int funcNameId;
+	};
+	std::vector<ByteInfo> bytes;
+	std::vector<std::string> files;
+	DWORD function_rva;
+	ULONGLONG function_length;
+};
 void PDBFileReader::ProcessSymbol(IDiaSymbol *symbol,DebugInfo &to)
 {
   DWORD section,offset,rva;
@@ -212,10 +297,34 @@ void PDBFileReader::ProcessSymbol(IDiaSymbol *symbol,DebugInfo &to)
   BSTR name = 0, undName = 0, srcFileName = 0;
 
   symbol->get_symTag((DWORD *) &tag);
+  if (tag != SymTagFunction)
+	  return;
   symbol->get_relativeVirtualAddress(&rva);
   symbol->get_length(&length);
   symbol->get_addressSection(&section);
   symbol->get_addressOffset(&offset);
+
+  if (addressMap.count(rva))
+  {
+	  return;
+  }
+  else
+  {
+	  addressMap[rva] = length;
+  }
+
+  FunctionLineInfo sym(symbol);
+
+
+  if(!sym.bytes.empty()) for (int i = 0; i < sym.function_length; ++i)
+  {
+	  const FunctionLineInfo::ByteInfo& b = sym.bytes[i];
+	  auto p = std::make_pair(b.line, b.fileId);
+	  sourceLocToBytes[p]++;
+	  int f = b.funcNameId;
+	  if (f != -1)
+		  funcToBytes[f]++;
+  }
 
   // get length from type for data
   if( tag == SymTagData )
@@ -244,7 +353,18 @@ void PDBFileReader::ProcessSymbol(IDiaSymbol *symbol,DebugInfo &to)
   symbol->get_name(&name);
   symbol->get_undecoratedName(&undName);
 
-  if ((name != NULL) && (std::wstring(name).find(L"foo") != std::wstring::npos))
+  //if ((name != NULL) && (std::wstring(name).find(L".text") != std::wstring::npos))
+  //{
+  // DumpedSymbol sym(symbol);
+  // symbol->get_name(&name);
+  //}  
+  //if ((name != NULL) && (std::wstring(name).find(L"foo") != std::wstring::npos))
+  //{
+	 // DumpedSymbol sym(symbol);
+	 // symbol->get_name(&name);
+  //}
+
+  if (false)//((name != NULL) && (std::wstring(name).find(L"foo") != std::wstring::npos))
   {
       DumpedSymbol sym(symbol);
 
@@ -552,6 +672,45 @@ sBool PDBFileReader::ReadDebugInfo(sChar *fileName,DebugInfo &to)
       {
         ReadEverything(to);
 
+		////////////////////////////////////////////////////////////////////////////////////////////
+		typedef std::pair<std::pair<int, DWORD>, int> ptype;
+		std::vector<ptype> v;
+		v.assign(sourceLocToBytes.begin(), sourceLocToBytes.end());
+		std::sort(v.begin(), v.end(), [](auto a, auto b) {return a.second > b.second; });
+
+
+		////////////////////////////////////////////////////////////////////////////////////////////
+		std::vector<std::pair<int, int>> funcs;
+		funcs.assign(funcToBytes.begin(), funcToBytes.end());
+		std::sort(funcs.begin(), funcs.end(), [](auto a, auto b) {return a.second > b.second; });
+
+		////////////////////////////////////////////////////////////////////////////////////////////
+		if(false)
+		{
+			int ndump = v.size();
+			for (int i = 0; i < ndump; ++i)
+			{
+				auto& e = v[i];
+				//if (e.first.first == 274)
+				//{
+				//	printf("wtf\n");
+				//}
+
+				if (e.first.first == -1) continue;
+				printf("%S(%d): %d\n", fileNames[e.first.second].c_str(), e.first.first, e.second);
+			}
+		}
+		else
+		{
+			int ndump = funcs.size();
+			for (int i = 0; i < ndump; ++i)
+			{
+				auto& e = funcs[i];
+				printf("%S : %d\n", funcNames[e.first].c_str(), e.second);
+			}
+		}
+
+		exit(0);
         readOk = true;
         Session->Release();
       }
@@ -569,6 +728,44 @@ sBool PDBFileReader::ReadDebugInfo(sChar *fileName,DebugInfo &to)
   CoUninitialize();
 
   return readOk;
+}
+
+DWORD PDBFileReader::getFileNameId(DWORD in)
+{
+	if (fileMap.count(in))
+	{
+		return fileMap[in];
+	}
+
+	IDiaSourceFile* pFile;
+	Session->findFileById(in, &pFile);
+	BSTR pFileName;
+	pFile->get_fileName(&pFileName);
+	pFile->Release();
+	std::wstring fileName(pFileName);
+
+	auto it = files.find(fileName);
+	if (it != files.end())
+	{
+		fileMap[in] = it->second;
+		return it->second;
+	}
+
+	fileNames.push_back(fileName);
+	return fileMap[in] = files[fileName] = fileNames.size() - 1;
+}
+
+std::vector<std::wstring> PDBFileReader::funcNames;
+std::unordered_map<std::wstring, int> PDBFileReader::funcIndexByName;
+
+int PDBFileReader::getFunctionNameId(const std::wstring& funcName)
+{
+	auto p = funcIndexByName.insert(std::make_pair(funcName, funcNames.size()));
+	if (p.second)
+	{
+		funcNames.push_back(funcName);
+	}
+	return p.first->second;
 }
 
 /****************************************************************************/

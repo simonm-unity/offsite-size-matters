@@ -44,7 +44,11 @@ sInt DebugInfo::MakeString( sChar *s )
 
 bool virtAddressComp(const DISymbol &a,const DISymbol &b)
 {
-  return a.VA < b.VA;
+	if (a.VA < b.VA)
+		return true;
+	else if (b.VA < a.VA)
+		return false;
+	else return a.Size > b.Size;
 }
 
 static bool StripTemplateParams( std::string& str )
